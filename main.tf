@@ -2,24 +2,21 @@ provider "helm" {
   kubernetes {
     host                   = var.k8s_host
     cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-    client_certificate     = base64decode(var.k8s_client_certificate)
-    client_key             = base64decode(var.k8s_client_key)
+    token                  = var.k8s_client_token
   }
 }
 
 provider "kubectl" {
   host                   = var.k8s_host
   cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-  client_certificate     = base64decode(var.k8s_client_certificate)
-  client_key             = base64decode(var.k8s_client_key)
+  token                  = var.k8s_client_token
   load_config_file       = false
 }
 
 provider "kubernetes" {
   host                   = var.k8s_host
   cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-  client_certificate     = base64decode(var.k8s_client_certificate)
-  client_key             = base64decode(var.k8s_client_key)
+  token                  = var.k8s_client_token
 }
 
 resource "time_sleep" "warmup_90_seconds" {
@@ -69,32 +66,35 @@ data "kubernetes_secret" "istiod_cacerts" {
   }
   depends_on = [time_sleep.warmup_90_seconds]
 }
-data "kubernetes_secret" "es_password" {
-  metadata {
-    name      = "tsb-es-elastic-user"
-    namespace = "elastic-system"
-  }
+
+resource "tls_private_key" "iamsigningkey" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
 }
 
-data "kubernetes_secret" "es_cacert" {
+resource "kubernetes_secret_v1" "iamsigningkey" {
   metadata {
-    name      = "tsb-es-http-ca-internal"
-    namespace = "elastic-system"
+    name      = "iam-signing-key"
+    namespace = "tsb"
   }
+
+  data = {
+    "private.key" = tls_private_key.iamsigningkey.private_key_pem
+  }
+
+  type       = "kubernetes.io/generic"
+  depends_on = [kubernetes_namespace.tsb]
 }
 
+resource "helm_release" "managementplane" {
+  name       = "managementplane"
+  repository = var.tsb_helm_repository
+  chart      = "managementplane"
+  version    = var.tsb_helm_version
+  namespace  = "tsb"
+  timeout    = 900
 
-data "kubernetes_service" "es" {
-  metadata {
-    name      = "tsb-es-http"
-    namespace = "elastic-system"
-  }
-}
-
-data "template_file" "managementplane_values" {
-  template = file("${path.module}/manifests/tsb/managementplane-values.yaml.tmpl")
-
-  vars = {
+  values = [templatefile("${path.module}/manifests/tsb/managementplane-values.yaml.tmpl", {
     #tsb
     tsb_version  = var.tsb_version
     registry     = var.registry
@@ -102,30 +102,16 @@ data "template_file" "managementplane_values" {
     tsb_org      = var.tsb_org
     tsb_fqdn     = var.tsb_fqdn
     #eck
-    es_host     = data.kubernetes_service.es.status[0].load_balancer[0].ingress[0].ip
-    es_username = "elastic"
-    es_password = data.kubernetes_secret.es_password.data["elastic"]
+    es_host     = var.es_host
+    es_username = var.es_username
+    es_password = var.es_password
     # demo db profile
     db_username = "tsb"
     db_password = "tsb-postgres-password"
     # demo ldap profile
     ldap_binddn       = "cn=admin,dc=tetrate,dc=io"
     ldap_bindpassword = "admin"
-  }
-}
-
-
-resource "helm_release" "managementplane" {
-  name                = "managementplane"
-  repository          = "https://dl.cloudsmith.io/basic/tetrate/tsb-helm/helm/charts/"
-  chart               = "managementplane"
-  version             = var.tsb_helm_version
-  namespace           = "tsb"
-  timeout             = 900
-  repository_username = var.tsb_helm_username
-  repository_password = var.tsb_helm_password
-
-  values = [data.template_file.managementplane_values.rendered]
+  })]
   set {
     name  = "secrets.tsb.cert"
     value = data.kubernetes_secret.tsb_server_cert.data["tls.crt"]
@@ -146,15 +132,15 @@ resource "helm_release" "managementplane" {
 
   set {
     name  = "secrets.elasticsearch.cacert"
-    value = data.kubernetes_secret.es_cacert.data["tls.crt"]
+    value = var.es_cacert
 
   }
 
 }
 
-resource "time_sleep" "wait_180_seconds" {
+resource "time_sleep" "wait_240_seconds" {
   depends_on      = [helm_release.managementplane]
-  create_duration = "180s"
+  create_duration = "240s"
 }
 
 data "kubernetes_service" "tsb" {
@@ -162,5 +148,5 @@ data "kubernetes_service" "tsb" {
     name      = "envoy"
     namespace = "tsb"
   }
-  depends_on = [time_sleep.wait_180_seconds]
+  depends_on = [time_sleep.wait_240_seconds]
 }
